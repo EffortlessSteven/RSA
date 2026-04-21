@@ -78,8 +78,8 @@ pub(crate) fn pkcs1v15_encrypt_unpad(
 
     let k = em.len();
     let kdk = derive_kdk(d, k, ciphertext)?;
-    let candidate_lengths = irprf_sha256_hmac(&kdk, b"length", 256)?;
-    let alt_len = select_alt_len_ct(candidate_lengths.as_ref(), (k - 11) as u32);
+    let candidate_lengths = irprf_sha256_hmac_256(&kdk, b"length")?;
+    let alt_len = select_alt_len_ct(&candidate_lengths, (k - 11) as u32);
     let alt_message = irprf_sha256_hmac(&kdk, b"message", k)?;
     let scan = scan_pkcs1v15_encryption_block(em);
 
@@ -135,6 +135,14 @@ fn irprf_sha256_hmac(kdk: &[u8; 32], label: &[u8], out_len: usize) -> Result<Zer
     Ok(out)
 }
 
+#[inline]
+fn irprf_sha256_hmac_256(kdk: &[u8; 32], label: &[u8]) -> Result<Zeroizing<[u8; 256]>> {
+    let out = irprf_sha256_hmac(kdk, label, 256)?;
+    let mut fixed = Zeroizing::new([0u8; 256]);
+    fixed.copy_from_slice(out.as_ref());
+    Ok(fixed)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct ScanResult {
     valid: Choice,
@@ -142,9 +150,7 @@ struct ScanResult {
 }
 
 #[inline]
-fn select_alt_len_ct(cl: &[u8], max_msg_len: u32) -> u32 {
-    debug_assert_eq!(cl.len(), 256);
-
+fn select_alt_len_ct(cl: &[u8; 256], max_msg_len: u32) -> u32 {
     let max_bits = u32::BITS - max_msg_len.leading_zeros();
     let mask = if max_bits == 0 {
         0
