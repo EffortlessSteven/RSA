@@ -8,7 +8,7 @@
 
 use alloc::{vec, vec::Vec};
 use const_oid::AssociatedOid;
-use crypto_bigint::{BoxedUint, Choice, CtEq};
+use crypto_bigint::{BoxedUint, Choice, CtAssign, CtEq, CtSelect};
 use digest::{Digest, KeyInit};
 use hmac::{Hmac, Mac};
 use rand_core::TryCryptoRng;
@@ -160,11 +160,15 @@ fn select_alt_len_ct(cl: &[u8; 256], max_msg_len: u32) -> u32 {
         (1u32 << max_bits) - 1
     };
 
-    cl.chunks_exact(2).fold(0u32, |selected, candidate| {
+    let mut selected = 0u32;
+
+    for candidate in cl.chunks_exact(2) {
         let candidate = u16::from_be_bytes([candidate[0], candidate[1]]) as u32 & mask;
         let within_range = Choice::from_u32_le(candidate, max_msg_len);
-        within_range.select_u32(selected, candidate)
-    })
+        selected.ct_assign(&candidate, within_range);
+    }
+
+    selected
 }
 
 #[inline]
@@ -184,13 +188,17 @@ fn scan_pkcs1v15_encryption_block(em: &[u8]) -> ScanResult {
     for (i, byte) in em.iter().enumerate().skip(2) {
         let is_zero = byte.ct_eq(&0u8);
         let capture = searching & is_zero;
-        sep_index = capture.select_u32(sep_index, i as u32);
+        let index = i as u32;
+        sep_index.ct_assign(&index, capture);
         found_sep |= is_zero;
         searching &= !is_zero;
     }
 
-    let real_len = found_sep.select_u32(0, em.len() as u32 - (sep_index + 1));
-    let ps_len = found_sep.select_u32(0, sep_index.wrapping_sub(2));
+    let real_len_if_found = em.len() as u32 - (sep_index + 1);
+    let ps_len_if_found = sep_index.wrapping_sub(2);
+
+    let real_len = u32::ct_select(&0u32, &real_len_if_found, found_sep);
+    let ps_len = u32::ct_select(&0u32, &ps_len_if_found, found_sep);
     let valid = prefix_ok & found_sep & Choice::from_u32_le(8, ps_len);
 
     ScanResult { valid, real_len }
@@ -198,7 +206,8 @@ fn scan_pkcs1v15_encryption_block(em: &[u8]) -> ScanResult {
 
 #[inline]
 fn clamp_len(len: u32, max_msg_len: u32) -> u32 {
-    Choice::from_u32_lt(max_msg_len, len).select_u32(len, max_msg_len)
+    let too_long = Choice::from_u32_lt(max_msg_len, len);
+    u32::ct_select(&len, &max_msg_len, too_long)
 }
 
 #[inline]
@@ -210,7 +219,7 @@ fn gather_message_byte_ct(tail: &[u8], start: u32, len: u32, index: u32) -> u8 {
     for (source_index, &byte) in tail.iter().enumerate() {
         let source_index = source_index as u32;
         let take = in_range & source_index.ct_eq(&target);
-        selected = take.select_u8(selected, byte);
+        selected.ct_assign(&byte, take);
     }
 
     selected
@@ -224,19 +233,22 @@ fn select_message_ct(em: &[u8], am: &[u8], real_len: u32, alt_len: u32, valid: C
     let max_msg_len = (em.len() - 11) as u32;
     let real_len = clamp_len(real_len, max_msg_len);
     let alt_len = clamp_len(alt_len, max_msg_len);
-    let selected_len = valid.select_u32(alt_len, real_len) as usize;
+    let selected_len = u32::ct_select(&alt_len, &real_len, valid) as usize;
     let tail = max_msg_len as usize;
     let em_tail = &em[11..];
     let am_tail = &am[11..];
     let em_start = max_msg_len.wrapping_sub(real_len);
     let am_start = max_msg_len.wrapping_sub(alt_len);
+
+    // Gather over the full k - 11 tail from both candidates, then truncate to the
+    // selected length after the fixed pass.
     let mut out = vec![0u8; tail];
 
     for (i, out_byte) in out.iter_mut().enumerate() {
         let index = i as u32;
         let em_byte = gather_message_byte_ct(em_tail, em_start, real_len, index);
         let am_byte = gather_message_byte_ct(am_tail, am_start, alt_len, index);
-        *out_byte = valid.select_u8(am_byte, em_byte);
+        *out_byte = u8::ct_select(&am_byte, &em_byte, valid);
     }
 
     out.truncate(selected_len);
@@ -349,10 +361,26 @@ mod tests {
     }
 
     #[test]
+    fn test_select_alt_len_ct_accepts_max_msg_len() {
+        let mut cl = [0xffu8; 256];
+        cl[0..2].copy_from_slice(&11u16.to_be_bytes());
+        cl[2..4].copy_from_slice(&10u16.to_be_bytes());
+
+        assert_eq!(select_alt_len_ct(&cl, 10), 10);
+    }
+
+    #[test]
     fn test_select_alt_len_ct_handles_full_u32_mask() {
         let cl = [0xffu8; 256];
 
         assert_eq!(select_alt_len_ct(&cl, u32::MAX), 0xffff);
+    }
+
+    #[test]
+    fn test_clamp_len_caps_at_max_msg_len() {
+        assert_eq!(clamp_len(9, 10), 9);
+        assert_eq!(clamp_len(10, 10), 10);
+        assert_eq!(clamp_len(11, 10), 10);
     }
 
     #[test]
@@ -377,6 +405,18 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_pkcs1v15_encryption_block_uses_first_separator() {
+        let em = [
+            0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xaa, 0x00, 0xbb,
+        ];
+
+        let scan = scan_pkcs1v15_encryption_block(&em);
+
+        assert!(bool::from(scan.valid));
+        assert_eq!(scan.real_len, 3);
+    }
+
+    #[test]
     fn test_scan_pkcs1v15_encryption_block_missing_separator() {
         let em = [
             0x00, 0x02, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
@@ -395,6 +435,26 @@ mod tests {
         let out = select_message_ct(&em, &am, 2, 2, Choice::TRUE);
 
         assert_eq!(out, vec![0xaa, 0xbb]);
+    }
+
+    #[test]
+    fn test_select_message_ct_truncates_to_valid_real_len() {
+        let em = [0u8, 2, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0xaa, 0xbb, 0xcc];
+        let am = [0u8, 2, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0xdd, 0xee, 0xff];
+
+        let out = select_message_ct(&em, &am, 1, 2, Choice::TRUE);
+
+        assert_eq!(out, vec![0xcc]);
+    }
+
+    #[test]
+    fn test_select_message_ct_truncates_to_invalid_alt_len() {
+        let em = [0u8, 2, 9, 9, 9, 9, 9, 9, 9, 9, 0, 0xaa, 0xbb, 0xcc];
+        let am = [0u8, 2, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0xdd, 0xee, 0xff];
+
+        let out = select_message_ct(&em, &am, 1, 2, Choice::FALSE);
+
+        assert_eq!(out, vec![0xee, 0xff]);
     }
 
     #[test]
